@@ -5,7 +5,8 @@ Python 3.11+; instalacija (jednom):
     python -m pip install fast-flights==3.0 airportsdata==20260905 tzdata typing_extensions certifi
 
 Pokretanje:
-    python letovi.py
+    python letovi.py                 # forma u browseru: gradovi + kalendar
+    python letovi.py --cli           # unos u terminalu
     python letovi.py --from Podgorica --to Kopenhagen --date 26.11.2026
     python letovi.py --from TGD --to CPH --date 2026-11-26 --sort duration
     python letovi.py --from Podgorica --to Kopenhagen --date 26.11.2026 \
@@ -36,6 +37,10 @@ from pathlib import Path
 import sys
 import ssl
 import time
+import secrets
+import threading
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 import unicodedata
 from urllib.parse import urlencode
@@ -464,8 +469,9 @@ def dedupe(options):
 
 
 class Planner:
-    def __init__(self, args):
+    def __init__(self, args, on_progress=None):
         self.args = args
+        self.on_progress = on_progress
         self.bus = FlixBus(args.adults, args.timeout)
         self.flights = GoogleFlights(args.adults, args.timeout, args.max_stops)
         self.cache, self.status = {}, []
@@ -485,7 +491,10 @@ class Planner:
             self.cache[key] = dedupe(options)
             return self.cache[key]
         provider = self.flights if mode == "flight" else self.bus
-        print(f"  {provider.name}: {origin.name} → {dest.name}, {day:%d.%m.%Y}", flush=True)
+        progress = f"{provider.name}: {origin.name} → {dest.name}, {day:%d.%m.%Y}"
+        print(f"  {progress}", flush=True)
+        if self.on_progress:
+            self.on_progress(progress)
         row = {"source": provider.name, "route": f"{origin.name} → {dest.name}",
                "date": day.isoformat(), "status": "ok"}
         try:
@@ -614,8 +623,11 @@ def save_report(options, status, origin, dest, day, args):
         notes = "".join(f"<li>{escape(n)}</li>" for n in x.notes)
         links = " ".join(f'<a target="_blank" rel="noopener noreferrer" href="{escape(u, quote=True)}">'
                          f'Provjeri ponudu {j}</a>' for j, u in enumerate(dict.fromkeys(x.links), 1))
-        cards.append(f'<article data-kind="{"mixed" if x.mixed else x.legs[0].mode}">'
-                     f'<h2>{i}. {escape(x.label)}</h2><p class="price">{escape(price_text(x))}</p>'
+        kind = "mixed" if x.mixed else ("flight" if x.legs[0].mode == "flight" else "bus")
+        cards.append(f'<article data-kind="{kind}" data-duration="{x.duration}" '
+                     f'data-price="{x.price if x.price is not None else ""}" '
+                     f'data-departure="{instant(x.legs[0].departure).timestamp()}">'
+                     f'<h2><span class="rank">{i}</span>. {escape(x.label)}</h2><p class="price">{escape(price_text(x))}</p>'
                      f'<p>Ukupno {duration_text(x.duration)} · {len(x.legs)-1} presjedanja</p>'
                      f'{"".join(rows)}<details><summary>Napomene i doplate</summary><ul>{notes}</ul>'
                      f'</details><p>{links}</p></article>')
@@ -627,23 +639,47 @@ def save_report(options, status, origin, dest, day, args):
 h1{font-size:30px}article{background:white;border:1px solid #dce5ed;border-radius:16px;padding:24px;margin:20px 0}
 h2{font-size:19px}.price{font-size:25px;font-weight:700;color:#087564}.leg{padding:14px;background:#f4f7fb;border-radius:9px;margin:8px 0}
 .wait{color:#795600;margin:10px}.notice{padding:18px;background:#fff4d9;border-radius:12px}a{color:#145aa1;display:inline-block;margin:8px 18px 0 0}
-select{padding:10px;font:inherit}summary{cursor:pointer}li{margin:8px 0}small{color:#526579}</style><main>'''
+select{padding:10px;font:inherit;max-width:100%}.controls{display:flex;gap:16px;flex-wrap:wrap;align-items:end}
+.controls label{display:grid;gap:6px}summary{cursor:pointer}li{margin:8px 0}small{color:#526579}</style><main>'''
     html += (f'<h1>{escape(origin.name)} → {escape(dest.name)}</h1><p>{day:%d.%m.%Y} · '
              f'{args.adults} odraslih · {len(options)} opcija</p><p class="notice">'
              'Cijene su za izabrani broj putnika, prema izvorima u trenutku provjere. '
              'Prtljag i navedene doplate mogu se dodatno placati. Kombinacije imaju odvojene karte; '
              'lokalni transfer nije provjeren ni ukljucen. Provjeri sve dionice prije kupovine. '
              'Obuhvat: Google Flights i FlixBus, uz ogranicenja pretrage. Nije garantovana potpuna lista.</p>'
-             f'<small>Provjereno (UTC): {stamp}</small><p><label>Prikazi: <select id="filter">'
+             f'<small>Provjereno (UTC): {stamp}</small><p id="visible-count" aria-live="polite"></p>'
+             '<div class="controls"><label>Prikaži <select id="filter">'
              '<option value="all">Sve</option><option value="flight">Avioni</option>'
-             '<option value="bus">Autobusi</option><option value="mixed">Kombinacije</option></select></label></p>')
+             '<option value="bus">Autobusi</option><option value="mixed">Kombinacije</option></select></label>'
+             '<label>Sortiraj <select id="sort">'
+             f'<option value="duration" {"selected" if args.sort == "duration" else ""}>Trajanje: najkraće prvo</option>'
+             f'<option value="price" {"selected" if args.sort == "price" else ""}>Cijena: najniža prvo</option>'
+             f'<option value="departure" {"selected" if args.sort == "departure" else ""}>Polazak: najranije prvo</option>'
+             '</select></label></div><p><small>Trajanje uključuje čekanja i presjedanja. '
+             'Ponude bez cijene su na kraju pri sortiranju po cijeni.</small></p>')
+    html += '<section id="options">'
     html += "".join(cards) if cards else (
         '<p>Pretraga nije dala prikazive opcije. Neki izvori nijesu uspjesno provjereni; '
         'ovo ne znaci da nema putovanja. Detalji su u statusu ispod.</p>'
         if any(s['status'] == 'error' for s in status) else
         '<p>Nema pronadjenih opcija u izabranim izvorima i ogranicenjima pretrage.</p>')
+    html += '</section><p id="empty-filter" hidden>Nema opcija za ovaj tip prevoza. Izaberi „Sve“.</p>'
     html += f'<details><summary>Status svih pretraga</summary><ul>{statuses}</ul></details></main>'
-    html += '''<script>document.getElementById('filter').onchange=function(){document.querySelectorAll('article').forEach(x=>{x.hidden=this.value!=='all'&&x.dataset.kind!==this.value})}</script></html>'''
+    html += '''<script>
+const container=document.getElementById('options'),filter=document.getElementById('filter'),sort=document.getElementById('sort');
+function value(card,key){const raw=card.dataset[key];return raw===''||raw===undefined?Infinity:Number(raw)}
+function update(){
+ const cards=Array.from(container.querySelectorAll('article'));
+ cards.sort((a,b)=>{const x=value(a,sort.value),y=value(b,sort.value);
+  return (x<y?-1:x>y?1:0)||value(a,'duration')-value(b,'duration')||value(a,'departure')-value(b,'departure')});
+ let visible=0;
+ cards.forEach(card=>{container.appendChild(card);card.hidden=filter.value!=='all'&&card.dataset.kind!==filter.value;
+  if(!card.hidden){visible++;card.querySelector('.rank').textContent=visible}});
+ document.getElementById('visible-count').textContent=`Prikazano ${visible} od ${cards.length} opcija`;
+ document.getElementById('empty-filter').hidden=visible!==0||cards.length===0;
+}
+filter.addEventListener('change',update);sort.addEventListener('change',update);update();
+</script></html>'''
     html_path.write_text(html, encoding="utf-8")
     return html_path, json_path
 
@@ -651,6 +687,8 @@ select{padding:10px;font:inherit}summary{cursor:pointer}li{margin:8px 0}small{co
 def parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--from", dest="origin")
+    p.add_argument("--gui", action="store_true", help="Forma sa kalendarom i prijedlozima gradova u browseru")
+    p.add_argument("--cli", action="store_true", help="Unos u terminalu umjesto forme")
     p.add_argument("--to", dest="destination")
     p.add_argument("--date", dest="day")
     p.add_argument("--adults", type=int, default=1)
@@ -670,26 +708,246 @@ def parser():
     return p
 
 
+def validate_trip(args):
+    if not 1 <= args.adults <= 9:
+        raise ValueError("Broj odraslih mora biti između 1 i 9.")
+    if args.mode not in ("all", "flights", "bus") or args.sort not in ("price", "duration", "departure"):
+        raise ValueError("Nepoznat tip prevoza ili sortiranja.")
+    if not 0 <= args.max_stops <= 5 or not 0 <= args.connection_days <= 7:
+        raise ValueError("Presjedanja: 0–5; dodatni dani: 0–7.")
+    if (args.min_transfer < 1 or args.max_wait_hours * 60 < args.min_transfer
+            or args.max_hours < 1 or not 0 < args.timeout <= 120 or args.limit < 1):
+        raise ValueError("Neispravna ograničenja vremena, trajanja ili prikaza.")
+    if not args.origin or not args.destination or not args.day:
+        raise ValueError("Unesi polazište, odredište i datum.")
+    if len(args.origin) > 100 or len(args.destination) > 100:
+        raise ValueError("Naziv grada je predugačak.")
+    origin, dest, day = resolve(args.origin), resolve(args.destination), parse_date(args.day)
+    if not origin.name or not dest.name or norm(origin.name) == norm(dest.name):
+        raise ValueError("Unesi dva različita grada.")
+    tz = airports().get(origin.codes[0], {}).get("tz", "Europe/Podgorica") if origin.codes else "Europe/Podgorica"
+    if day < datetime.now(ZoneInfo(tz)).date():
+        raise ValueError("Datum polaska je u prošlosti.")
+    return origin, dest, day
+
+
+def form_html(args, token):
+    today = datetime.now(ZoneInfo("Europe/Podgorica")).date()
+    tomorrow = today + timedelta(days=1)
+    local_names = {"Belgrade": "Beograd", "Copenhagen": "Kopenhagen", "Vienna": "Beč",
+                   "Budapest": "Budimpešta", "Rome": "Rim", "Paris": "Pariz", "Munich": "Minhen",
+                   "Zurich": "Cirih", "Prague": "Prag", "Warsaw": "Varšava", "Brussels": "Brisel",
+                   "Athens": "Atina", "Barcelona": "Barselona", "Stockholm": "Stokholm"}
+    suggestions = []
+    for city, codes in CATALOG.items():
+        label = local_names.get(city, city)
+        suggestions.append(f'<option value="{escape(label, quote=True)}">{escape(city)} · {", ".join(codes)}</option>')
+        if label != city:
+            suggestions.append(f'<option value="{escape(city, quote=True)}">{escape(label)} · {", ".join(codes)}</option>')
+        for code in codes:
+            suggestions.append(f'<option value="{code}">{escape(label)}</option>')
+    selected_day = parse_date(args.day).isoformat() if args.day else tomorrow.isoformat()
+    page = r'''<!doctype html><html lang="sr-Latn"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Pronađi putovanje</title>
+<style>body{font:16px system-ui;margin:0;background:#f0f4f8;color:#172637}main{max-width:960px;margin:auto;padding:30px 20px}
+h1{font-size:34px;margin-bottom:8px}.intro{color:#526579;margin:0 0 24px}form{background:white;padding:26px;border:1px solid #dce5ed;border-radius:18px}
+.route{display:grid;grid-template-columns:1fr 44px 1fr;gap:14px;align-items:end}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:20px}
+label.field{display:grid;gap:8px;font-weight:600}input,select,button{font:inherit;box-sizing:border-box}input,select{border:1px solid #b9c8d7;border-radius:9px;padding:12px;width:100%;background:white;color:#172637}
+input:focus,select:focus{outline:3px solid #b9e4df;border-color:#087564}button{cursor:pointer;border:0;border-radius:9px;padding:13px;background:#e7eef5;color:#172637}
+button.primary{background:#087564;color:white;padding:14px 24px;font-weight:700}button:disabled{opacity:.55;cursor:wait}.quick{display:flex;gap:10px;margin-top:10px}.quick button{padding:7px 12px;font-size:14px}
+.check{display:flex;gap:10px;align-items:center;margin:22px 0}.check input{width:auto}.actions{display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+.help{font-size:14px;color:#526579}.status{background:white;border-radius:12px;padding:18px;margin:22px 0;white-space:pre-wrap}a{color:#075f51;font-weight:600}
+#results{width:100%;min-height:1000px;border:0;border-radius:12px;background:white;margin-top:18px}[hidden]{display:none!important}
+@media(max-width:600px){.route{grid-template-columns:1fr}.route button{justify-self:center}.grid{grid-template-columns:1fr}form{padding:18px}h1{font-size:28px}}</style>
+<main><h1>Gdje putujemo?</h1><p class="intro">Avioni, autobusi i veze sa presjedanjem — jedna pretraga.</p>
+<form id="search-form"><div class="route">
+<label class="field">Odakle<input id="origin" name="origin" list="cities" required maxlength="100" autocomplete="off" placeholder="npr. Podgorica" value="__ORIGIN__"></label>
+<button id="swap" type="button" aria-label="Zamijeni polazište i odredište" title="Zamijeni gradove">⇄</button>
+<label class="field">Gdje<input id="destination" name="destination" list="cities" required maxlength="100" autocomplete="off" placeholder="npr. Beograd ili Kopenhagen" value="__DEST__"></label>
+</div><datalist id="cities">__CITIES__</datalist>
+<p class="help">Počni da kucaš grad i izaberi prijedlog. Možeš unijeti i aerodromski kod, npr. TGD.</p>
+<div class="grid"><div><label class="field">Datum polaska<input id="day" name="day" type="date" required min="__TODAY__" value="__DAY__"></label>
+<div class="quick"><button type="button" data-day="__TODAY__">Danas</button><button type="button" data-day="__TOMORROW__">Sjutra</button></div></div>
+<label class="field">Broj odraslih<select id="adults" name="adults">__ADULTS__</select></label>
+<label class="field">Prevoz<select id="mode" name="mode"><option value="all">Avioni i autobusi</option><option value="flights">Samo avioni</option><option value="bus">Samo autobusi</option></select></label>
+<label class="field">Prvo prikaži<select id="initial-sort" name="sort"><option value="duration">Najkraće putovanje</option><option value="price">Najnižu cijenu</option><option value="departure">Najraniji polazak</option></select></label></div>
+<label class="check"><input id="mixed" type="checkbox" __CHECKED__> Uključi i kombinacije autobusa i aviona</label>
+<div class="actions"><button class="primary" id="submit" type="submit">Pronađi putovanja</button><span class="help">U rezultatima možeš promijeniti redosljed bez nove pretrage.</span></div></form>
+<div id="status" class="status" role="status" aria-live="polite" hidden></div>
+<p id="result-links" hidden><a id="open-results" target="_blank" rel="noopener">Otvori rezultate u novom prozoru ↗</a></p>
+<iframe id="results" title="Rezultati putovanja" hidden></iframe>
+<p class="help">Prozor Python programa treba da ostane otvoren dok koristiš pretragu.</p></main>
+<script>
+const token=__TOKEN__,form=document.getElementById('search-form'),button=document.getElementById('submit'),statusBox=document.getElementById('status');
+let polling=false;
+document.getElementById('mode').value=__MODE__;
+document.getElementById('initial-sort').value=__SORT__;
+function syncMixed(){document.getElementById('mixed').disabled=document.getElementById('mode').value!=='all'}
+document.getElementById('mode').onchange=syncMixed;syncMixed();
+document.getElementById('swap').onclick=()=>{const a=document.getElementById('origin'),b=document.getElementById('destination');[a.value,b.value]=[b.value,a.value]};
+document.querySelectorAll('[data-day]').forEach(b=>b.onclick=()=>{document.getElementById('day').value=b.dataset.day});
+function message(text){statusBox.hidden=false;statusBox.textContent=text}
+function busy(value){button.disabled=value;button.textContent=value?'Pretraga je u toku…':'Pronađi putovanja'}
+async function api(path,options={}){const res=await fetch(path,{...options,headers:{'Content-Type':'application/json','X-Search-Token':token}});
+ const data=await res.json();if(!res.ok)throw new Error(data.error||'Zahtjev nije uspio.');return data}
+function poll(){
+ if(polling)return;polling=true;
+ const tick=async()=>{try{const s=await api('/api/status');
+  if(s.state==='running'){busy(true);message('Tražim putovanja…\n'+s.progress);setTimeout(tick,1000);return}
+  busy(false);polling=false;
+  if(s.state==='error'){message(s.error);return}
+  if(s.state==='done'){message(`Pronađeno ${s.count} opcija. Neuspjelih pretraga: ${s.errors}.`);
+   const url='/results?token='+encodeURIComponent(token)+'&job='+s.job;
+   document.getElementById('results').src=url;document.getElementById('results').hidden=false;
+   document.getElementById('open-results').href=url;document.getElementById('result-links').hidden=false}
+ }catch(e){polling=false;busy(false);message('Veza sa programom je prekinuta. Provjeri da li je Python program i dalje otvoren.')}};
+ tick();
+}
+form.onsubmit=async event=>{event.preventDefault();busy(true);document.getElementById('results').hidden=true;document.getElementById('result-links').hidden=true;
+ try{const payload=Object.fromEntries(new FormData(form));payload.no_mixed=!document.getElementById('mixed').checked;
+  await api('/api/search',{method:'POST',body:JSON.stringify(payload)});message('Pretraga je pokrenuta…');poll();
+ }catch(e){busy(false);message(e.message)}};
+poll();
+</script></html>'''
+    replacements = {
+        "__ORIGIN__": escape(args.origin or "Podgorica", quote=True),
+        "__DEST__": escape(args.destination or "", quote=True), "__CITIES__": "".join(suggestions),
+        "__TODAY__": today.isoformat(), "__TOMORROW__": tomorrow.isoformat(), "__DAY__": selected_day,
+        "__ADULTS__": "".join(f'<option value="{n}" {"selected" if n == args.adults else ""}>{n}</option>' for n in range(1, 10)),
+        "__CHECKED__": "" if args.no_mixed else "checked", "__TOKEN__": json.dumps(token),
+        "__MODE__": json.dumps(args.mode), "__SORT__": json.dumps(args.sort),
+    }
+    # Substitute once, so user-entered text cannot accidentally become a template token.
+    import re
+    return re.sub(r"__[A-Z_]+__", lambda match: replacements[match.group()], page)
+
+
+class LocalSearch:
+    def __init__(self, args):
+        self.args, self.lock = args, threading.Lock()
+        self.token = secrets.token_urlsafe(32)
+        self.data = {"state": "idle", "progress": ""}
+        self.result_path = None
+
+    def snapshot(self):
+        with self.lock:
+            return dict(self.data)
+
+    def progress(self, text):
+        with self.lock:
+            self.data["progress"] = text
+
+    def start(self, payload):
+        if not isinstance(payload, dict):
+            raise ValueError("Neispravan unos.")
+        args = argparse.Namespace(**vars(self.args))
+        for key in ("origin", "destination", "day", "mode", "sort"):
+            value = payload.get(key)
+            if not isinstance(value, str):
+                raise ValueError("Popuni gradove, datum i tip pretrage.")
+            setattr(args, key, value.strip())
+        args.adults = int(payload.get("adults", 1))
+        args.no_mixed = payload.get("no_mixed", False) is True
+        origin, dest, day = validate_trip(args)
+        with self.lock:
+            if self.data["state"] == "running":
+                raise ValueError("Jedna pretraga je već u toku. Sačekaj rezultate.")
+            self.data = {"state": "running", "progress": "Pripremam pretragu…", "job": secrets.token_hex(8)}
+            self.result_path = None
+        threading.Thread(target=self.run, args=(args, origin, dest, day), daemon=True).start()
+
+    def run(self, args, origin, dest, day):
+        try:
+            planner = Planner(args, on_progress=self.progress)
+            options = planner.run(origin, dest, day)
+            html_path, _ = save_report(options, planner.status, origin, dest, day, args)
+            with self.lock:
+                self.result_path = html_path
+                self.data.update(state="done", count=len(options),
+                                 errors=sum(s["status"] == "error" for s in planner.status))
+        except Exception as e:
+            with self.lock:
+                self.data.update(state="error", error=f"Pretraga nije završena: {e}")
+
+
+def make_local_server(args):
+    app = LocalSearch(args)
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def reply(self, code, content, content_type="application/json; charset=utf-8"):
+            if isinstance(content, dict):
+                content = json.dumps(content, ensure_ascii=False)
+            data = content.encode("utf-8") if isinstance(content, str) else content
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def allowed(self):
+            return self.headers.get("Host") == f"127.0.0.1:{self.server.server_port}"
+
+        def do_GET(self):
+            from urllib.parse import urlsplit, parse_qs
+            if not self.allowed():
+                return self.reply(403, {"error": "Pristup nije dozvoljen."})
+            url = urlsplit(self.path)
+            if url.path == "/":
+                return self.reply(200, form_html(args, app.token), "text/html; charset=utf-8")
+            if url.path == "/api/status" and self.headers.get("X-Search-Token") == app.token:
+                return self.reply(200, app.snapshot())
+            if url.path == "/results" and parse_qs(url.query).get("token") == [app.token]:
+                with app.lock:
+                    path = app.result_path
+                if path is not None:
+                    return self.reply(200, path.read_bytes(), "text/html; charset=utf-8")
+            self.reply(404, {"error": "Stranica nije dostupna."})
+
+        def do_POST(self):
+            if (not self.allowed() or self.path != "/api/search"
+                    or self.headers.get("X-Search-Token") != app.token):
+                return self.reply(403, {"error": "Zahtjev nije dozvoljen."})
+            try:
+                size = int(self.headers.get("Content-Length", "0"))
+                if not 0 < size <= 8192:
+                    raise ValueError("Neispravan unos.")
+                app.start(json.loads(self.rfile.read(size)))
+                self.reply(202, {"status": "started"})
+            except (ValueError, TypeError, RuntimeError) as e:
+                self.reply(400, {"error": str(e)})
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    return server, app
+
+
+def launch_form(args):
+    server, _ = make_local_server(args)
+    url = f"http://127.0.0.1:{server.server_port}/"
+    print(f"\nForma za putovanja: {url}\nZa izlaz pritisni Ctrl+C u ovom prozoru.", flush=True)
+    threading.Timer(0.3, lambda: webbrowser.open(url)).start()
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+    return 0
+
+
 def main(argv=None):
     p = parser()
+    argv = sys.argv[1:] if argv is None else argv
     args = p.parse_args(argv)
     try:
-        if not 1 <= args.adults <= 9:
-            raise ValueError("Broj odraslih mora biti izmedju 1 i 9.")
-        if not 0 <= args.max_stops <= 5 or not 0 <= args.connection_days <= 7:
-            raise ValueError("Presjedanja: 0–5; dodatni dani: 0–7.")
-        if (args.min_transfer < 1 or args.max_wait_hours * 60 < args.min_transfer
-                or args.max_hours < 1 or not 0 < args.timeout <= 120 or args.limit < 1):
-            raise ValueError("Neispravna ogranicenja vremena, trajanja ili prikaza.")
-        origin = resolve(args.origin or input("Odakle (grad ili IATA, npr. Podgorica): "))
-        dest = resolve(args.destination or input("Gdje (grad ili IATA, npr. Kopenhagen): "))
-        day = parse_date(args.day or input("Datum polaska (npr. 26.11.2026): "))
-        if not origin.name or not dest.name or norm(origin.name) == norm(dest.name):
-            raise ValueError("Unesi dva razlicita grada.")
-        # Use the origin city's date when known, otherwise the user's regional default.
-        tz = airports().get(origin.codes[0], {}).get("tz", "Europe/Podgorica") if origin.codes else "Europe/Podgorica"
-        if day < datetime.now(ZoneInfo(tz)).date():
-            raise ValueError("Datum polaska je u proslosti.")
+        if args.gui or (not argv and not args.cli):
+            return launch_form(args)
+        args.origin = args.origin or input("Odakle (grad ili IATA, npr. Podgorica): ")
+        args.destination = args.destination or input("Gdje (grad ili IATA, npr. Kopenhagen): ")
+        args.day = args.day or input("Datum polaska (npr. 26.11.2026): ")
+        origin, dest, day = validate_trip(args)
         print(f"\n{origin.name} → {dest.name} | {day:%d.%m.%Y} | {args.adults} odraslih | EUR")
         print("Pretraga: Google Flights + FlixBus. Cijene i dostupnost mogu se promijeniti.")
         if args.mode == "all" and not args.no_mixed:
